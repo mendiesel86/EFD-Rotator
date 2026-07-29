@@ -2,35 +2,45 @@
 #include <stdlib.h>
 #include <lvgl.h>
 #include "app.h"
+#include "motor_control.h"
 
 #define PI_VALUE 3.14159265f
 #define MIN_DIAMETER_MM 10.0f
 #define MAX_DIAMETER_MM 2000.0f
 #define MIN_SPEED_MMPS 0.10f
 #define MAX_SPEED_MMPS 50.0f
+#define MIN_TEST_POWER 5.0f
+#define MAX_TEST_POWER 100.0f
 
 enum EditField
 {
     EDIT_NONE,
     EDIT_DIAMETER,
-    EDIT_SPEED
+    EDIT_SPEED,
+    EDIT_POWER
 };
 
 static lv_obj_t *labelDiameter = nullptr;
 static lv_obj_t *labelSpeed = nullptr;
 static lv_obj_t *labelRPM = nullptr;
 static lv_obj_t *labelStatus = nullptr;
+static lv_obj_t *labelPower = nullptr;
+static lv_obj_t *labelDirection = nullptr;
+static lv_obj_t *labelActualPower = nullptr;
 static lv_obj_t *inputOverlay = nullptr;
 static lv_obj_t *inputTextArea = nullptr;
 static lv_obj_t *inputErrorLabel = nullptr;
 static lv_obj_t *diameterButton = nullptr;
 static lv_obj_t *speedButton = nullptr;
+static lv_obj_t *powerButton = nullptr;
+static lv_obj_t *directionButton = nullptr;
 static lv_obj_t *startButton = nullptr;
 static lv_obj_t *stopButton = nullptr;
 static lv_obj_t *hintLabel = nullptr;
 
 static float diameter = 168.3f;
 static float speed = 4.5f;
+static float testPower = 25.0f;
 static EditField activeField = EDIT_NONE;
 static bool machineRunning = false;
 
@@ -54,6 +64,53 @@ static void updateDisplayValues()
 
     snprintf(buffer, sizeof(buffer), "%.2f RPM", calcRPM());
     lv_label_set_text(labelRPM, buffer);
+
+    snprintf(buffer, sizeof(buffer), "%.0f%%", testPower);
+    lv_label_set_text(labelPower, buffer);
+
+    lv_label_set_text(labelDirection,
+                      motorControlIsForward() ? "FORWARD" : "REVERSE");
+}
+
+static void updateMotorStatus()
+{
+    char buffer[40];
+    snprintf(buffer, sizeof(buffer), "Output %.0f%%",
+             motorControlGetActualPercent());
+    lv_label_set_text(labelActualPower, buffer);
+}
+
+static void motorTimerEvent(lv_timer_t *timer)
+{
+    (void)timer;
+    motorControlUpdate();
+    updateMotorStatus();
+
+    if (!machineRunning && motorControlGetActualPercent() <= 0.0f)
+    {
+        lv_label_set_text(labelStatus, "READY");
+        lv_obj_set_style_text_color(labelStatus,
+                                    lv_palette_main(LV_PALETTE_GREEN), 0);
+    }
+}
+
+static void setControlLock(bool locked)
+{
+    lv_obj_t *controls[] = {
+        diameterButton, speedButton, powerButton, directionButton, startButton};
+
+    for (lv_obj_t *control : controls)
+    {
+        if (locked)
+            lv_obj_add_state(control, LV_STATE_DISABLED);
+        else
+            lv_obj_clear_state(control, LV_STATE_DISABLED);
+    }
+
+    if (locked)
+        lv_obj_clear_state(stopButton, LV_STATE_DISABLED);
+    else
+        lv_obj_add_state(stopButton, LV_STATE_DISABLED);
 }
 
 static void setMachineState(bool running)
@@ -62,31 +119,22 @@ static void setMachineState(bool running)
 
     if (running)
     {
+        motorControlSetTargetPercent(testPower);
+        motorControlStart();
         lv_label_set_text(labelStatus, "RUNNING");
         lv_obj_set_style_text_color(labelStatus,
-                                    lv_palette_main(LV_PALETTE_GREEN),
-                                    0);
-
-        lv_obj_add_state(diameterButton, LV_STATE_DISABLED);
-        lv_obj_add_state(speedButton, LV_STATE_DISABLED);
-        lv_obj_add_state(startButton, LV_STATE_DISABLED);
-        lv_obj_clear_state(stopButton, LV_STATE_DISABLED);
-
-        lv_label_set_text(hintLabel, "Values locked while running");
+                                    lv_palette_main(LV_PALETTE_GREEN), 0);
+        lv_label_set_text(hintLabel, "Soft start active - press STOP at any time");
+        setControlLock(true);
     }
     else
     {
-        lv_label_set_text(labelStatus, "READY");
+        motorControlStop();
+        lv_label_set_text(labelStatus, "STOPPING");
         lv_obj_set_style_text_color(labelStatus,
-                                    lv_palette_main(LV_PALETTE_GREEN),
-                                    0);
-
-        lv_obj_clear_state(diameterButton, LV_STATE_DISABLED);
-        lv_obj_clear_state(speedButton, LV_STATE_DISABLED);
-        lv_obj_clear_state(startButton, LV_STATE_DISABLED);
-        lv_obj_add_state(stopButton, LV_STATE_DISABLED);
-
-        lv_label_set_text(hintLabel, "Touch a blue value box to edit");
+                                    lv_palette_main(LV_PALETTE_ORANGE), 0);
+        lv_label_set_text(hintLabel, "Soft stop active");
+        setControlLock(false);
     }
 }
 
@@ -120,21 +168,25 @@ static void closeInputPopup()
 
 static bool validateInputValue(float value)
 {
-    if (activeField == EDIT_DIAMETER)
+    if (activeField == EDIT_DIAMETER &&
+        (value < MIN_DIAMETER_MM || value > MAX_DIAMETER_MM))
     {
-        if (value < MIN_DIAMETER_MM || value > MAX_DIAMETER_MM)
-        {
-            showInputError("Diameter must be 10 to 2000 mm");
-            return false;
-        }
+        showInputError("Diameter must be 10 to 2000 mm");
+        return false;
     }
-    else if (activeField == EDIT_SPEED)
+
+    if (activeField == EDIT_SPEED &&
+        (value < MIN_SPEED_MMPS || value > MAX_SPEED_MMPS))
     {
-        if (value < MIN_SPEED_MMPS || value > MAX_SPEED_MMPS)
-        {
-            showInputError("Speed must be 0.10 to 50.00 mm/s");
-            return false;
-        }
+        showInputError("Speed must be 0.10 to 50.00 mm/s");
+        return false;
+    }
+
+    if (activeField == EDIT_POWER &&
+        (value < MIN_TEST_POWER || value > MAX_TEST_POWER))
+    {
+        showInputError("Test power must be 5 to 100 percent");
+        return false;
     }
 
     return true;
@@ -146,7 +198,6 @@ static void applyInputValue()
         return;
 
     const char *text = lv_textarea_get_text(inputTextArea);
-
     if (text == nullptr || text[0] == '\0')
     {
         showInputError("Enter a value");
@@ -155,7 +206,6 @@ static void applyInputValue()
 
     char *endPointer = nullptr;
     float newValue = strtof(text, &endPointer);
-
     if (endPointer == text || *endPointer != '\0')
     {
         showInputError("Enter numbers only");
@@ -169,6 +219,11 @@ static void applyInputValue()
         diameter = newValue;
     else if (activeField == EDIT_SPEED)
         speed = newValue;
+    else if (activeField == EDIT_POWER)
+    {
+        testPower = newValue;
+        motorControlSetTargetPercent(testPower);
+    }
 
     updateDisplayValues();
     closeInputPopup();
@@ -177,7 +232,6 @@ static void applyInputValue()
 static void keypadEvent(lv_event_t *event)
 {
     lv_event_code_t code = lv_event_get_code(event);
-
     if (code == LV_EVENT_VALUE_CHANGED)
         clearInputError();
     else if (code == LV_EVENT_READY)
@@ -204,14 +258,11 @@ static void openInputPopup(EditField field)
         return;
 
     activeField = field;
-
     inputOverlay = lv_obj_create(lv_scr_act());
     lv_obj_remove_style_all(inputOverlay);
     lv_obj_set_size(inputOverlay, 800, 480);
-    lv_obj_set_pos(inputOverlay, 0, 0);
-    lv_obj_set_style_bg_color(inputOverlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_color(inputOverlay, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(inputOverlay, LV_OPA_80, 0);
-    lv_obj_clear_flag(inputOverlay, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *panel = lv_obj_create(inputOverlay);
     lv_obj_set_size(panel, 700, 450);
@@ -222,12 +273,14 @@ static void openInputPopup(EditField field)
     lv_obj_set_style_radius(panel, 12, 0);
     lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
 
+    const char *titleText = "Enter Test Power (%)";
+    if (field == EDIT_DIAMETER)
+        titleText = "Enter Pipe Diameter (mm)";
+    else if (field == EDIT_SPEED)
+        titleText = "Enter Travel Speed (mm/s)";
+
     lv_obj_t *title = lv_label_create(panel);
-    lv_label_set_text(title,
-                      field == EDIT_DIAMETER
-                          ? "Enter Pipe Diameter (mm)"
-                          : "Enter Travel Speed (mm/s)");
-    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_label_set_text(title, titleText);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 6);
 
@@ -242,18 +295,15 @@ static void openInputPopup(EditField field)
     char currentValue[24];
     if (field == EDIT_DIAMETER)
         snprintf(currentValue, sizeof(currentValue), "%.1f", diameter);
-    else
+    else if (field == EDIT_SPEED)
         snprintf(currentValue, sizeof(currentValue), "%.2f", speed);
-
+    else
+        snprintf(currentValue, sizeof(currentValue), "%.0f", testPower);
     lv_textarea_set_text(inputTextArea, currentValue);
-    lv_textarea_set_cursor_pos(inputTextArea, LV_TEXTAREA_CURSOR_LAST);
 
     inputErrorLabel = lv_label_create(panel);
-    lv_label_set_text(inputErrorLabel, "");
     lv_obj_set_style_text_color(inputErrorLabel,
-                                lv_palette_main(LV_PALETTE_RED),
-                                0);
-    lv_obj_set_style_text_font(inputErrorLabel, &lv_font_montserrat_16, 0);
+                                lv_palette_main(LV_PALETTE_RED), 0);
     lv_obj_align(inputErrorLabel, LV_ALIGN_TOP_MID, 0, 104);
     lv_obj_add_flag(inputErrorLabel, LV_OBJ_FLAG_HIDDEN);
 
@@ -269,10 +319,8 @@ static void openInputPopup(EditField field)
     lv_obj_align(cancelButton, LV_ALIGN_BOTTOM_LEFT, 32, -7);
     lv_obj_set_style_bg_color(cancelButton, lv_color_hex(0x555555), 0);
     lv_obj_add_event_cb(cancelButton, cancelButtonEvent, LV_EVENT_CLICKED, nullptr);
-
     lv_obj_t *cancelText = lv_label_create(cancelButton);
     lv_label_set_text(cancelText, "CANCEL");
-    lv_obj_set_style_text_font(cancelText, &lv_font_montserrat_22, 0);
     lv_obj_center(cancelText);
 
     lv_obj_t *okButton = lv_btn_create(panel);
@@ -280,10 +328,8 @@ static void openInputPopup(EditField field)
     lv_obj_align(okButton, LV_ALIGN_BOTTOM_RIGHT, -32, -7);
     lv_obj_set_style_bg_color(okButton, lv_palette_main(LV_PALETTE_GREEN), 0);
     lv_obj_add_event_cb(okButton, okButtonEvent, LV_EVENT_CLICKED, nullptr);
-
     lv_obj_t *okText = lv_label_create(okButton);
     lv_label_set_text(okText, "OK");
-    lv_obj_set_style_text_font(okText, &lv_font_montserrat_22, 0);
     lv_obj_center(okText);
 }
 
@@ -299,6 +345,21 @@ static void speedButtonEvent(lv_event_t *event)
         openInputPopup(EDIT_SPEED);
 }
 
+static void powerButtonEvent(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED)
+        openInputPopup(EDIT_POWER);
+}
+
+static void directionButtonEvent(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED || machineRunning)
+        return;
+
+    motorControlSetDirection(!motorControlIsForward());
+    updateDisplayValues();
+}
+
 static void startButtonEvent(lv_event_t *event)
 {
     if (lv_event_get_code(event) == LV_EVENT_CLICKED)
@@ -311,122 +372,114 @@ static void stopButtonEvent(lv_event_t *event)
         setMachineState(false);
 }
 
+static lv_obj_t *createValueButton(int x, int y, int width,
+                                   lv_event_cb_t callback, lv_obj_t **label)
+{
+    lv_obj_t *button = lv_btn_create(lv_scr_act());
+    lv_obj_set_size(button, width, 58);
+    lv_obj_set_pos(button, x, y);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0x2D5F88), 0);
+    lv_obj_add_event_cb(button, callback, LV_EVENT_CLICKED, nullptr);
+    *label = lv_label_create(button);
+    lv_obj_set_style_text_font(*label, &lv_font_montserrat_22, 0);
+    lv_obj_center(*label);
+    return button;
+}
+
 void appCreate()
 {
+    motorControlBegin();
+    motorControlSetTargetPercent(testPower);
+
     lv_obj_clean(lv_scr_act());
     lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x101010), 0);
 
     lv_obj_t *title = lv_label_create(lv_scr_act());
     lv_label_set_text(title, "EFD RC-1");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_30, 0);
-    lv_obj_set_style_text_color(title, lv_color_white(), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 12);
 
     lv_obj_t *version = lv_label_create(lv_scr_act());
-    lv_label_set_text(version, "v0.3.2");
+    lv_label_set_text(version, "v0.4.0");
     lv_obj_set_style_text_color(version, lv_color_hex(0x888888), 0);
-    lv_obj_align(version, LV_ALIGN_TOP_LEFT, 18, 18);
+    lv_obj_set_pos(version, 15, 15);
 
     labelStatus = lv_label_create(lv_scr_act());
-    lv_obj_set_style_text_font(labelStatus, &lv_font_montserrat_22, 0);
-    lv_obj_align(labelStatus, LV_ALIGN_TOP_RIGHT, -28, 25);
+    lv_obj_set_style_text_font(labelStatus, &lv_font_montserrat_20, 0);
+    lv_obj_align(labelStatus, LV_ALIGN_TOP_RIGHT, -20, 18);
 
     lv_obj_t *diameterTitle = lv_label_create(lv_scr_act());
     lv_label_set_text(diameterTitle, "Pipe Diameter");
-    lv_obj_set_style_text_font(diameterTitle, &lv_font_montserrat_22, 0);
-    lv_obj_set_style_text_color(diameterTitle, lv_color_white(), 0);
-    lv_obj_set_pos(diameterTitle, 55, 90);
-
-    diameterButton = lv_btn_create(lv_scr_act());
-    lv_obj_set_size(diameterButton, 325, 65);
-    lv_obj_set_pos(diameterButton, 55, 122);
-    lv_obj_set_style_bg_color(diameterButton, lv_color_hex(0x2D5F88), 0);
-    lv_obj_add_event_cb(diameterButton,
-                        diameterButtonEvent,
-                        LV_EVENT_CLICKED,
-                        nullptr);
-
-    labelDiameter = lv_label_create(diameterButton);
-    lv_obj_set_style_text_font(labelDiameter, &lv_font_montserrat_24, 0);
-    lv_obj_center(labelDiameter);
+    lv_obj_set_pos(diameterTitle, 45, 72);
+    diameterButton = createValueButton(45, 96, 290,
+                                       diameterButtonEvent, &labelDiameter);
 
     lv_obj_t *speedTitle = lv_label_create(lv_scr_act());
     lv_label_set_text(speedTitle, "Travel Speed");
-    lv_obj_set_style_text_font(speedTitle, &lv_font_montserrat_22, 0);
-    lv_obj_set_style_text_color(speedTitle, lv_color_white(), 0);
-    lv_obj_set_pos(speedTitle, 55, 215);
-
-    speedButton = lv_btn_create(lv_scr_act());
-    lv_obj_set_size(speedButton, 325, 65);
-    lv_obj_set_pos(speedButton, 55, 247);
-    lv_obj_set_style_bg_color(speedButton, lv_color_hex(0x2D5F88), 0);
-    lv_obj_add_event_cb(speedButton,
-                        speedButtonEvent,
-                        LV_EVENT_CLICKED,
-                        nullptr);
-
-    labelSpeed = lv_label_create(speedButton);
-    lv_obj_set_style_text_font(labelSpeed, &lv_font_montserrat_24, 0);
-    lv_obj_center(labelSpeed);
+    lv_obj_set_pos(speedTitle, 45, 170);
+    speedButton = createValueButton(45, 194, 290,
+                                    speedButtonEvent, &labelSpeed);
 
     lv_obj_t *rpmPanel = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(rpmPanel, 345, 190);
-    lv_obj_set_pos(rpmPanel, 420, 105);
+    lv_obj_set_size(rpmPanel, 370, 112);
+    lv_obj_set_pos(rpmPanel, 385, 78);
     lv_obj_set_style_bg_color(rpmPanel, lv_color_hex(0x181818), 0);
     lv_obj_set_style_border_color(rpmPanel, lv_color_hex(0x444444), 0);
-    lv_obj_set_style_border_width(rpmPanel, 2, 0);
-    lv_obj_set_style_radius(rpmPanel, 10, 0);
     lv_obj_clear_flag(rpmPanel, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *rpmTitle = lv_label_create(rpmPanel);
     lv_label_set_text(rpmTitle, "Required Roller RPM");
-    lv_obj_set_style_text_font(rpmTitle, &lv_font_montserrat_22, 0);
-    lv_obj_set_style_text_color(rpmTitle, lv_color_white(), 0);
-    lv_obj_align(rpmTitle, LV_ALIGN_TOP_MID, 0, 18);
-
+    lv_obj_align(rpmTitle, LV_ALIGN_TOP_MID, 0, 5);
     labelRPM = lv_label_create(rpmPanel);
-    lv_obj_set_style_text_font(labelRPM, &lv_font_montserrat_38, 0);
-    lv_obj_set_style_text_color(labelRPM,
-                                lv_palette_main(LV_PALETTE_RED),
-                                0);
-    lv_obj_align(labelRPM, LV_ALIGN_CENTER, 0, 25);
+    lv_obj_set_style_text_font(labelRPM, &lv_font_montserrat_32, 0);
+    lv_obj_set_style_text_color(labelRPM, lv_palette_main(LV_PALETTE_RED), 0);
+    lv_obj_align(labelRPM, LV_ALIGN_BOTTOM_MID, 0, -7);
+
+    lv_obj_t *powerTitle = lv_label_create(lv_scr_act());
+    lv_label_set_text(powerTitle, "Motor Test Power");
+    lv_obj_set_pos(powerTitle, 385, 205);
+    powerButton = createValueButton(385, 229, 170,
+                                    powerButtonEvent, &labelPower);
+
+    directionButton = createValueButton(575, 229, 180,
+                                        directionButtonEvent, &labelDirection);
+
+    labelActualPower = lv_label_create(lv_scr_act());
+    lv_obj_set_style_text_color(labelActualPower, lv_color_hex(0xBBBBBB), 0);
+    lv_obj_align(labelActualPower, LV_ALIGN_CENTER, 0, 70);
 
     hintLabel = lv_label_create(lv_scr_act());
+    lv_label_set_text(hintLabel, "Initial test is limited to 25% - verify direction first");
     lv_obj_set_style_text_color(hintLabel, lv_color_hex(0xAAAAAA), 0);
-    lv_obj_align(hintLabel, LV_ALIGN_BOTTOM_MID, 0, -118);
+    lv_obj_align(hintLabel, LV_ALIGN_BOTTOM_MID, 0, -100);
 
     startButton = lv_btn_create(lv_scr_act());
-    lv_obj_set_size(startButton, 245, 72);
-    lv_obj_align(startButton, LV_ALIGN_BOTTOM_LEFT, 55, -28);
-    lv_obj_set_style_bg_color(startButton,
-                              lv_palette_main(LV_PALETTE_GREEN),
-                              0);
-    lv_obj_add_event_cb(startButton,
-                        startButtonEvent,
-                        LV_EVENT_CLICKED,
-                        nullptr);
-
+    lv_obj_set_size(startButton, 245, 68);
+    lv_obj_align(startButton, LV_ALIGN_BOTTOM_LEFT, 55, -20);
+    lv_obj_set_style_bg_color(startButton, lv_palette_main(LV_PALETTE_GREEN), 0);
+    lv_obj_add_event_cb(startButton, startButtonEvent, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *startText = lv_label_create(startButton);
-    lv_label_set_text(startText, "START");
-    lv_obj_set_style_text_font(startText, &lv_font_montserrat_24, 0);
+    lv_label_set_text(startText, "START MOTOR");
+    lv_obj_set_style_text_font(startText, &lv_font_montserrat_22, 0);
     lv_obj_center(startText);
 
     stopButton = lv_btn_create(lv_scr_act());
-    lv_obj_set_size(stopButton, 245, 72);
-    lv_obj_align(stopButton, LV_ALIGN_BOTTOM_RIGHT, -55, -28);
-    lv_obj_set_style_bg_color(stopButton,
-                              lv_palette_main(LV_PALETTE_RED),
-                              0);
-    lv_obj_add_event_cb(stopButton,
-                        stopButtonEvent,
-                        LV_EVENT_CLICKED,
-                        nullptr);
-
+    lv_obj_set_size(stopButton, 245, 68);
+    lv_obj_align(stopButton, LV_ALIGN_BOTTOM_RIGHT, -55, -20);
+    lv_obj_set_style_bg_color(stopButton, lv_palette_main(LV_PALETTE_RED), 0);
+    lv_obj_add_event_cb(stopButton, stopButtonEvent, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *stopText = lv_label_create(stopButton);
-    lv_label_set_text(stopText, "STOP");
-    lv_obj_set_style_text_font(stopText, &lv_font_montserrat_24, 0);
+    lv_label_set_text(stopText, "STOP MOTOR");
+    lv_obj_set_style_text_font(stopText, &lv_font_montserrat_22, 0);
     lv_obj_center(stopText);
 
     updateDisplayValues();
-    setMachineState(false);
+    updateMotorStatus();
+    machineRunning = false;
+    setControlLock(false);
+    lv_label_set_text(labelStatus, "READY");
+    lv_obj_set_style_text_color(labelStatus,
+                                lv_palette_main(LV_PALETTE_GREEN), 0);
+
+    lv_timer_create(motorTimerEvent, 20, nullptr);
 }
